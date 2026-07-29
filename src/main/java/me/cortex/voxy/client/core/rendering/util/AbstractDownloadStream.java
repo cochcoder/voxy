@@ -38,24 +38,7 @@ public abstract class AbstractDownloadStream {
 
     public abstract void free();
 
-    //Backend-selected global download stream; see AbstractUploadStream.INSTANCE() for
-    // why the holder lives on the abstract class (GL classload safety on Vulkan).
-    private static AbstractDownloadStream INSTANCE;
-
     public static AbstractDownloadStream INSTANCE() {
-        var instance = INSTANCE;
-        if (instance == null) {
-            instance = INSTANCE = new DownloadStream(1 << 25);//32 mb download buffer
-        }
-        return instance;
-    }
-
-    public static void setInstance(AbstractDownloadStream instance) {
-        if (INSTANCE != null) throw new IllegalStateException("Download stream already initialized");
-        INSTANCE = instance;
-    }
-
-    public static void clearInstance() {
-        INSTANCE = null;
+        return RenderBackendServices.current().downloadStream();
     }
 }

@@ -52,29 +52,8 @@ public abstract class AbstractUploadStream {
 
     public abstract void free();
 
-    //The render-thread upload stream, backend-selected. The VK path installs its
-    // implementation via setInstance BEFORE any render code runs; on the GL path
-    // first access lazily creates the GL UploadStream exactly as the old eager
-    // static did (there is always a GL context by then). Living HERE (not on
-    // UploadStream) matters: loading UploadStream runs GL capability queries,
-    // which must never happen when MC is on Vulkan.
-    private static AbstractUploadStream INSTANCE;
-
     public static AbstractUploadStream INSTANCE() {
-        var instance = INSTANCE;
-        if (instance == null) {
-            instance = INSTANCE = new UploadStream(1 << 26);//64 mb upload buffer
-        }
-        return instance;
-    }
-
-    public static void setInstance(AbstractUploadStream instance) {
-        if (INSTANCE != null) throw new IllegalStateException("Upload stream already initialized");
-        INSTANCE = instance;
-    }
-
-    public static void clearInstance() {
-        INSTANCE = null;
+        return RenderBackendServices.current().uploadStream();
     }
 
     public static long alignUp(long val, long alignment) {

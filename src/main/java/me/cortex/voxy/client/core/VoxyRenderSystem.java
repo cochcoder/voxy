@@ -88,7 +88,7 @@ public class VoxyRenderSystem {
         // entire renderer is the VkRenderCore and nothing below may run.
         if (me.cortex.voxy.client.core.vk.VulkanBackend.shouldUseVulkan()) {
             this.worldIn = world;
-            this.vkCore = new me.cortex.voxy.client.core.vk.render.VkRenderCore(world, sm);
+            this.vkCore = me.cortex.voxy.client.core.vk.render.VkRenderCore.create(world, sm);
             this.visbleSectionStream = this.vkCore.getVisibleSectionStream();//Sodium visibility mixins feed it on VK too
             this.modelService = null;
             this.renderGen = null;
