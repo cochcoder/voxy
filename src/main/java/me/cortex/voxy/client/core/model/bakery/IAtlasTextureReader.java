@@ -1,6 +1,7 @@
 package me.cortex.voxy.client.core.model.bakery;
 
 import com.mojang.blaze3d.textures.GpuTexture;
+import me.cortex.voxy.client.core.rendering.util.RenderBackendServices;
 
 //Backend-neutral readback of MC's stitched block atlas into a CPU int[]
 // (RGBA8, one int per texel, byte order R,G,B,A — identical for GL
@@ -16,20 +17,11 @@ public abstract class IAtlasTextureReader {
     /** Reads mip 0 of the given RGBA8 atlas into a fresh {@code int[width*height]}. */
     public abstract int[] read(GpuTexture atlas, int width, int height);
 
-    private static IAtlasTextureReader INSTANCE;
-
     public static IAtlasTextureReader INSTANCE() {
-        var i = INSTANCE;
-        if (i == null) i = INSTANCE = new GlAtlasTextureReader();
-        return i;
+        return RenderBackendServices.current().atlasTextureReader();
     }
 
-    public static void setInstance(IAtlasTextureReader instance) {
-        if (INSTANCE != null) throw new IllegalStateException("Atlas texture reader already initialized");
-        INSTANCE = instance;
-    }
-
-    public static void clearInstance() {
-        INSTANCE = null;
+    public static IAtlasTextureReader createGlDefault() {
+        return new GlAtlasTextureReader();
     }
 }

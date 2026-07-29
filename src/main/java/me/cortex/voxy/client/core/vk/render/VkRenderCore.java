@@ -8,11 +8,9 @@ import me.cortex.voxy.client.core.model.ModelBakerySubsystem;
 import me.cortex.voxy.client.core.rendering.RenderDistanceTracker;
 import me.cortex.voxy.client.core.rendering.ViewportSelector;
 import me.cortex.voxy.client.core.rendering.building.RenderGenerationService;
-import me.cortex.voxy.client.core.model.bakery.IAtlasTextureReader;
 import me.cortex.voxy.client.core.rendering.bounding.StreamedBoundStore;
 import me.cortex.voxy.client.core.rendering.hierachical.AsyncNodeManager;
-import me.cortex.voxy.client.core.rendering.util.AbstractDownloadStream;
-import me.cortex.voxy.client.core.rendering.util.AbstractUploadStream;
+import me.cortex.voxy.client.core.rendering.util.RenderBackendServices;
 import me.cortex.voxy.client.core.vk.MinecraftVkHost;
 import me.cortex.voxy.client.core.vk.MinecraftVkHostAdapter;
 import me.cortex.voxy.client.core.vk.VkAtlasTextureReader;
@@ -23,6 +21,7 @@ import me.cortex.voxy.client.core.vk.VkUploadStream;
 import me.cortex.voxy.client.core.vk.VulkanBackend;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.thread.ServiceManager;
+import me.cortex.voxy.common.util.RollbackScope;
 import me.cortex.voxy.common.world.WorldEngine;
 import net.caffeinemc.mods.sodium.client.render.chunk.ChunkRenderMatrices;
 import net.caffeinemc.mods.sodium.client.util.FogParameters;
@@ -45,6 +44,7 @@ public class VkRenderCore {
     private final VkFrameCtx frameCtx;
     private final VkUploadStream uploadStream;
     private final VkDownloadStream downloadStream;
+    private final RenderBackendServices.Registration backendRegistration;
 
     private final RenderProperties properties;
     private final VkModelStore modelStore;
@@ -63,71 +63,170 @@ public class VkRenderCore {
     private final RenderDistanceTracker renderDistanceTracker;
     private final ViewportSelector<VkViewport> viewportSelector;
 
-    public VkRenderCore(WorldEngine world, ServiceManager sm) {
+    private record Components(
+            WorldEngine world,
+            VkFrameCtx frameCtx,
+            VkUploadStream uploadStream,
+            VkDownloadStream downloadStream,
+            RenderBackendServices.Registration backendRegistration,
+            RenderProperties properties,
+            VkModelStore modelStore,
+            ModelBakerySubsystem modelService,
+            RenderGenerationService renderGen,
+            VkSectionGeometryData geometryData,
+            AsyncNodeManager nodeManager,
+            VkNodeCleaner nodeCleaner,
+            VkTraversal traversal,
+            VkTerrainRenderer terrainRenderer,
+            VkCompositor compositor,
+            VkSSAO ssao,
+            VkBoundRenderer boundRenderer,
+            StreamedBoundStore visibleSectionStream,
+            RenderDistanceTracker renderDistanceTracker,
+            ViewportSelector<VkViewport> viewportSelector) {
+    }
+
+    public static VkRenderCore create(WorldEngine world, ServiceManager sm) {
         world.acquireRef();
         Logger.info("Creating Voxy pure-Vulkan render core");
-        try {
-            this.worldIn = world;
+        try (var rollback = new RollbackScope()) {
+            rollback.defer(world::releaseRef);
+
             var host = MinecraftVkHost.get();
             if (host == null) throw new IllegalStateException("No Minecraft Vulkan host adapter registered");
             var vctx = VulkanBackend.context();//adopts MC's device
-            this.frameCtx = new VkFrameCtx(vctx);
+            var frameCtx = new VkFrameCtx(vctx);
+            rollback.defer(frameCtx::free);
 
-            //Install the VK streams BEFORE any shared class touches the singletons
-            this.uploadStream = new VkUploadStream(this.frameCtx, 1 << 26);//64 mb, same as GL
-            this.downloadStream = new VkDownloadStream(this.frameCtx, 1 << 25);//32 mb, same as GL
-            AbstractUploadStream.setInstance(this.uploadStream);
-            AbstractDownloadStream.setInstance(this.downloadStream);
+            var uploadStream = new VkUploadStream(frameCtx, 1 << 26);//64 mb, same as GL
+            rollback.defer(uploadStream::free);
+            var downloadStream = new VkDownloadStream(frameCtx, 1 << 25);//32 mb, same as GL
+            rollback.defer(downloadStream::free);
 
-            this.properties = RenderProperties.getRenderProperties();
+            //Shared rendering code resolves these services globally. Publish one
+            //owned registration so initialization is all-or-nothing.
+            var backendRegistration = RenderBackendServices.install(
+                    new RenderBackendServices.Services(
+                            uploadStream,
+                            downloadStream,
+                            new VkAtlasTextureReader(frameCtx)));
+            rollback.defer(backendRegistration::close);
 
-            //Install the VK atlas readback BEFORE the model bakery reads the block atlas
-            // (its constructor does a synchronous GPU->CPU copy)
-            IAtlasTextureReader.setInstance(
-                    new VkAtlasTextureReader(this.frameCtx));
+            var properties = RenderProperties.getRenderProperties();
 
-            this.modelStore = new VkModelStore(this.frameCtx, this.uploadStream);
-            this.modelService = new ModelBakerySubsystem(world.getMapper(), this.modelStore);
-            this.renderGen = new RenderGenerationService(world, this.modelService, sm, false);
+            var modelStore = new VkModelStore(frameCtx, uploadStream);
+            var modelStoreCleanup = rollback.defer(modelStore::free);
+            var modelService = new ModelBakerySubsystem(world.getMapper(), modelStore);
+            rollback.defer(modelService::shutdown);
+            modelStoreCleanup.cancel();//ModelBakerySubsystem owns the store now.
 
-            this.geometryData = new VkSectionGeometryData(this.frameCtx, 1 << 20, geometryCapacity());
-            this.nodeManager = new AsyncNodeManager(1 << 21, this.geometryData, this.renderGen,
-                    new VkNodeGpuOps(this.frameCtx, this.uploadStream));
-            this.nodeCleaner = new VkNodeCleaner(this.frameCtx, this.uploadStream, this.downloadStream, this.nodeManager);
-            this.traversal = new VkTraversal(this.frameCtx, this.uploadStream, this.downloadStream,
-                    this.properties, this.nodeManager, this.nodeCleaner, this.renderGen);
-            this.terrainRenderer = new VkTerrainRenderer(this.frameCtx, this.uploadStream, this.downloadStream,
-                    this.properties, this.geometryData, this.modelStore);
-            this.compositor = new VkCompositor(this.frameCtx, this.uploadStream, this.properties,
+            var renderGen = new RenderGenerationService(world, modelService, sm, false);
+            rollback.defer(renderGen::shutdown);
+
+            var geometryData = new VkSectionGeometryData(frameCtx, 1 << 20, geometryCapacity());
+            rollback.defer(geometryData::free);
+
+            var nodeGpuOps = new VkNodeGpuOps(frameCtx, uploadStream);
+            var nodeGpuOpsCleanup = rollback.defer(nodeGpuOps::free);
+            var nodeManager = new AsyncNodeManager(1 << 21, geometryData, renderGen, nodeGpuOps);
+            rollback.defer(nodeManager::stop);
+            nodeGpuOpsCleanup.cancel();//AsyncNodeManager owns the GPU operations now.
+
+            var nodeCleaner = new VkNodeCleaner(frameCtx, uploadStream, downloadStream, nodeManager);
+            rollback.defer(nodeCleaner::free);
+            var traversal = new VkTraversal(frameCtx, uploadStream, downloadStream,
+                    properties, nodeManager, nodeCleaner, renderGen);
+            rollback.defer(traversal::free);
+            var terrainRenderer = new VkTerrainRenderer(frameCtx, uploadStream, downloadStream,
+                    properties, geometryData, modelStore);
+            rollback.defer(terrainRenderer::free);
+            var compositor = new VkCompositor(frameCtx, uploadStream, properties,
                     VoxyConfig.CONFIG.useEnvironmentalFog);
-            this.ssao = new VkSSAO(this.frameCtx, this.uploadStream, this.properties, VoxyConfig.CONFIG.getSSAOMode());
+            rollback.defer(compositor::free);
+            var ssao = new VkSSAO(frameCtx, uploadStream, properties, VoxyConfig.CONFIG.getSSAOMode());
+            rollback.defer(ssao::free);
+
             //Depth-bound culling: Sodium's visibility mixins feed the store; the bound
             // renderer rasters visible-chunk AABBs into the depth-bound image so the
             // terrain shaders can discard LOD fragments vanilla terrain will cover.
-            this.visibleSectionStream = new StreamedBoundStore(
-                    size -> new VkBuffer(this.frameCtx, size));
-            this.boundRenderer = new VkBoundRenderer(this.frameCtx, this.uploadStream, this.properties);
+            var visibleSectionStream = new StreamedBoundStore(size -> new VkBuffer(frameCtx, size));
+            rollback.defer(visibleSectionStream::free);
+            var boundRenderer = new VkBoundRenderer(frameCtx, uploadStream, properties);
+            rollback.defer(boundRenderer::free);
 
-            world.setDirtyCallback(this.nodeManager::worldEvent);
-            Arrays.stream(world.getMapper().getBiomeEntries()).forEach(this.modelService::addBiome);
-            world.getMapper().setBiomeCallback(this.modelService::addBiome);
-            this.nodeManager.start();
+            rollback.defer(() -> detachWorldCallbacks(world));
+            world.setDirtyCallback(nodeManager::worldEvent);
+            Arrays.stream(world.getMapper().getBiomeEntries()).forEach(modelService::addBiome);
+            world.getMapper().setBiomeCallback(modelService::addBiome);
+            nodeManager.start();
 
-            this.viewportSelector = new ViewportSelector<>(() ->
-                    new VkViewport(this.frameCtx, this.properties, this.geometryData.getMaxSectionCount()));
+            var viewportSelector = new ViewportSelector<>(() ->
+                    new VkViewport(frameCtx, properties, geometryData.getMaxSectionCount()));
+            rollback.defer(viewportSelector::free);
 
             int minSec = Minecraft.getInstance().level.getMinSectionY() >> 5;
             int maxSec = (Minecraft.getInstance().level.getMaxSectionY() - 1) >> 5;
-            this.renderDistanceTracker = new RenderDistanceTracker(40, minSec, maxSec,
-                    this.nodeManager::addTopLevel, this.nodeManager::removeTopLevel);
-            this.setRenderDistance(VoxyConfig.CONFIG.sectionRenderDistance);
+            var renderDistanceTracker = new RenderDistanceTracker(40, minSec, maxSec,
+                    nodeManager::addTopLevel, nodeManager::removeTopLevel);
+            renderDistanceTracker.setRenderDistance(
+                    (int) Math.ceil(VoxyConfig.CONFIG.sectionRenderDistance + 1));
 
-            this.frameCtx.flushImmediate();
-            Logger.info("Voxy pure-Vulkan render core created with " + this.geometryData.getMaxCapacity() + " geometry capacity");
-        } catch (RuntimeException e) {
-            world.releaseRef();
-            throw e;
+            frameCtx.flushImmediate();
+            var core = new VkRenderCore(new Components(
+                    world,
+                    frameCtx,
+                    uploadStream,
+                    downloadStream,
+                    backendRegistration,
+                    properties,
+                    modelStore,
+                    modelService,
+                    renderGen,
+                    geometryData,
+                    nodeManager,
+                    nodeCleaner,
+                    traversal,
+                    terrainRenderer,
+                    compositor,
+                    ssao,
+                    boundRenderer,
+                    visibleSectionStream,
+                    renderDistanceTracker,
+                    viewportSelector));
+            rollback.commit();
+            Logger.info("Voxy pure-Vulkan render core created with "
+                    + geometryData.getMaxCapacity() + " geometry capacity");
+            return core;
         }
+    }
+
+    private VkRenderCore(Components components) {
+        this.worldIn = components.world;
+        this.frameCtx = components.frameCtx;
+        this.uploadStream = components.uploadStream;
+        this.downloadStream = components.downloadStream;
+        this.backendRegistration = components.backendRegistration;
+        this.properties = components.properties;
+        this.modelStore = components.modelStore;
+        this.modelService = components.modelService;
+        this.renderGen = components.renderGen;
+        this.geometryData = components.geometryData;
+        this.nodeManager = components.nodeManager;
+        this.nodeCleaner = components.nodeCleaner;
+        this.traversal = components.traversal;
+        this.terrainRenderer = components.terrainRenderer;
+        this.compositor = components.compositor;
+        this.ssao = components.ssao;
+        this.boundRenderer = components.boundRenderer;
+        this.visibleSectionStream = components.visibleSectionStream;
+        this.renderDistanceTracker = components.renderDistanceTracker;
+        this.viewportSelector = components.viewportSelector;
+    }
+
+    private static void detachWorldCallbacks(WorldEngine world) {
+        world.setDirtyCallback(null);
+        world.getMapper().setBiomeCallback(null);
+        world.getMapper().setStateCallback(null);
     }
 
     private static long geometryCapacity() {
@@ -303,9 +402,7 @@ public class VkRenderCore {
                     + "skipping GPU teardown to avoid destroying objects on a dead device");
         }
 
-        AbstractUploadStream.clearInstance();
-        AbstractDownloadStream.clearInstance();
-        IAtlasTextureReader.clearInstance();
+        this.backendRegistration.close();
 
         this.worldIn.releaseRef();
         Logger.info("VK render core shutdown completed");
